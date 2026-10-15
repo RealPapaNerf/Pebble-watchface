@@ -7,7 +7,7 @@ by MrReSc (Apache-2.0). Changes from the original:
 - Sunrise and sunset share the bottom-left cell, which shows whichever comes
   next (`RISE` before sunrise and after sunset, `SET` in between). After
   sunset it shows tomorrow's sunrise.
-- The bottom-right cell shows **density altitude** in feet (`DA FT`), rounded
+- The bottom-right cell shows **density altitude** in feet (labeled `DA`), rounded
   to the nearest 100 ft.
 - Its own app ID and name, so it installs alongside the original.
 

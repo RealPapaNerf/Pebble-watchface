@@ -628,7 +628,7 @@ static void prv_canvas_update_proc(Layer *layer, GContext *ctx) {
   prv_draw_info_cell(ctx,
                      GRect(CONTENT_MARGIN + cell_width + CELL_GAP,
                            second_info_y, cell_width, INFO_HEIGHT),
-                     InfoIconDensityAltitude, "DA FT",
+                     InfoIconDensityAltitude, "DA",
                      s_density_altitude_buffer);
 }
 
