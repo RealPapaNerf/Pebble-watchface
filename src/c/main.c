@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: 2026 MrReSc
 // SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Dallin Sumpter: mm/dd/yy date, one "next sun event" cell
+// (sunrise or sunset, whichever is next) and a density altitude cell.
 
 #include <pebble.h>
 
@@ -27,13 +29,26 @@
 #define PERSIST_KEY_SUNRISE_MINUTES 2
 #define PERSIST_KEY_SUNSET_MINUTES 3
 #define PERSIST_KEY_LAST_SUN_REQUEST 4
+#define PERSIST_KEY_NEXT_SUNRISE_MINUTES 5
+#define PERSIST_KEY_NEXT_SUN_DATE 6
+#define PERSIST_KEY_DENSITY_ALTITUDE_FT 7
+#define PERSIST_KEY_DENSITY_ALTITUDE_TIME 8
 #define SUN_RETRY_INTERVAL_SECONDS (6 * 60 * 60)
+// Fetch weather when the last reading is this old...
+#define WEATHER_REFRESH_SECONDS (30 * 60)
+// ...but don't ask the phone more often than this if requests keep failing.
+#define WEATHER_RETRY_SECONDS (10 * 60)
+// Older readings are replaced with dashes rather than shown as current.
+#define DENSITY_ALTITUDE_MAX_AGE_SECONDS (2 * 60 * 60)
+#define DENSITY_ALTITUDE_MIN_FT (-5000)
+#define DENSITY_ALTITUDE_MAX_FT 30000
 
 typedef enum {
   InfoIconSteps,
   InfoIconHeart,
   InfoIconSunrise,
-  InfoIconSunset
+  InfoIconSunset,
+  InfoIconDensityAltitude
 } InfoIcon;
 
 static Window *s_main_window;
@@ -45,19 +60,26 @@ static GFont s_info_font_large;
 
 static char s_time_buffer[5] = "0000";
 static char s_weekday_buffer[12] = "";
-static char s_date_buffer[10] = "--.--.--";
+static char s_date_buffer[10] = "--/--/--";
 static char s_ampm_buffer[8] = "";
 static char s_steps_buffer[12] = "--";
 static char s_heart_buffer[12] = "--";
-static char s_sunrise_buffer[8] = "--:--";
-static char s_sunset_buffer[8] = "--:--";
+static char s_sun_event_buffer[8] = "--:--";
+static bool s_sun_event_is_sunrise = true;
+static char s_density_altitude_buffer[8] = "--";
 static char s_battery_buffer[6] = "--%";
 
 static int32_t s_sun_date;
 static int32_t s_sunrise_minutes = -1;
 static int32_t s_sunset_minutes = -1;
+static int32_t s_next_sun_date;
+static int32_t s_next_sunrise_minutes = -1;
 static int32_t s_current_date;
+static int32_t s_current_minutes;
 static time_t s_last_sun_request_time;
+static int32_t s_density_altitude_ft;
+static time_t s_density_altitude_time;
+static time_t s_last_weather_request_time;
 static uint8_t s_battery_percent;
 static bool s_health_subscribed;
 static bool s_outbox_busy;
@@ -98,31 +120,84 @@ static void prv_format_sun_time(char *buffer, size_t size, int32_t minutes) {
   snprintf(buffer, size, "%02d:%02ld", hour, (long)(minutes % 60));
 }
 
+static bool prv_is_minute_of_day(int32_t minutes) {
+  return minutes >= 0 && minutes < 24 * 60;
+}
+
+// Picks whichever sun event comes next and formats it into one buffer:
+//   before today's sunrise  -> today's sunrise
+//   before today's sunset   -> today's sunset
+//   after today's sunset    -> tomorrow's sunrise
+// Just after midnight, before the phone has sent the new day's times,
+// yesterday's "tomorrow sunrise" is today's sunrise and is used instead.
 static void prv_refresh_sun_buffers(void) {
-  const bool current_and_valid = s_sun_date == s_current_date &&
-      s_sunrise_minutes >= 0 && s_sunrise_minutes < 24 * 60 &&
-      s_sunset_minutes >= 0 && s_sunset_minutes < 24 * 60;
-  if (current_and_valid) {
-    prv_format_sun_time(s_sunrise_buffer, sizeof(s_sunrise_buffer),
-                        s_sunrise_minutes);
-    prv_format_sun_time(s_sunset_buffer, sizeof(s_sunset_buffer),
-                        s_sunset_minutes);
-  } else {
-    snprintf(s_sunrise_buffer, sizeof(s_sunrise_buffer), "--:--");
-    snprintf(s_sunset_buffer, sizeof(s_sunset_buffer), "--:--");
+  int32_t event_minutes = -1;
+  bool is_sunrise = true;
+  const int32_t now = s_current_minutes;
+  const bool today_valid = s_sun_date == s_current_date &&
+      prv_is_minute_of_day(s_sunrise_minutes) &&
+      prv_is_minute_of_day(s_sunset_minutes);
+  if (today_valid) {
+    if (now < s_sunrise_minutes) {
+      event_minutes = s_sunrise_minutes;
+    } else if (now < s_sunset_minutes) {
+      event_minutes = s_sunset_minutes;
+      is_sunrise = false;
+    } else if (s_next_sun_date != 0) {
+      event_minutes = s_next_sunrise_minutes;
+    }
+  } else if (s_next_sun_date == s_current_date &&
+             prv_is_minute_of_day(s_next_sunrise_minutes) &&
+             now < s_next_sunrise_minutes) {
+    event_minutes = s_next_sunrise_minutes;
   }
+  s_sun_event_is_sunrise = is_sunrise;
+  prv_format_sun_time(s_sun_event_buffer, sizeof(s_sun_event_buffer),
+                      event_minutes);
 }
 
 static bool prv_has_sun_result_for_current_date(void) {
-  if (s_sun_date != s_current_date) {
+  // Data saved by the original watchface has no tomorrow sunrise; treat it
+  // as missing so the phone is asked again.
+  if (s_sun_date != s_current_date || s_next_sun_date == 0) {
     return false;
   }
-  const bool has_times = s_sunrise_minutes >= 0 &&
-      s_sunrise_minutes < 24 * 60 && s_sunset_minutes >= 0 &&
-      s_sunset_minutes < 24 * 60;
+  const bool has_times = prv_is_minute_of_day(s_sunrise_minutes) &&
+      prv_is_minute_of_day(s_sunset_minutes);
   const bool has_no_events = s_sunrise_minutes == -1 &&
       s_sunset_minutes == -1;
   return has_times || has_no_events;
+}
+
+static time_t prv_density_altitude_age(time_t now) {
+  if (s_density_altitude_time <= 0 || now < s_density_altitude_time) {
+    return (time_t)0x7fffffff;
+  }
+  return now - s_density_altitude_time;
+}
+
+static void prv_refresh_density_altitude_buffer(void) {
+  if (prv_density_altitude_age(time(NULL)) <= DENSITY_ALTITUDE_MAX_AGE_SECONDS) {
+    snprintf(s_density_altitude_buffer, sizeof(s_density_altitude_buffer),
+             "%ld", (long)s_density_altitude_ft);
+  } else {
+    snprintf(s_density_altitude_buffer, sizeof(s_density_altitude_buffer),
+             "--");
+  }
+}
+
+static bool prv_weather_is_stale(void) {
+  return prv_density_altitude_age(time(NULL)) >= WEATHER_REFRESH_SECONDS;
+}
+
+static bool prv_weather_request_is_due(void) {
+  if (!prv_weather_is_stale()) {
+    return false;
+  }
+  const time_t now = time(NULL);
+  return s_last_weather_request_time <= 0 ||
+      now < s_last_weather_request_time ||
+      now - s_last_weather_request_time >= WEATHER_RETRY_SECONDS;
 }
 
 static void prv_update_clock_state(const struct tm *local_time) {
@@ -144,11 +219,13 @@ static void prv_update_clock_state(const struct tm *local_time) {
     s_weekday_buffer[0] = '\0';
   }
   prv_uppercase_ascii(s_weekday_buffer);
-  if (strftime(s_date_buffer, sizeof(s_date_buffer), "%d.%m.%y", local_time) == 0) {
-    snprintf(s_date_buffer, sizeof(s_date_buffer), "--.--.--");
+  if (strftime(s_date_buffer, sizeof(s_date_buffer), "%m/%d/%y", local_time) == 0) {
+    snprintf(s_date_buffer, sizeof(s_date_buffer), "--/--/--");
   }
   s_current_date = prv_date_code(local_time);
+  s_current_minutes = local_time->tm_hour * 60 + local_time->tm_min;
   prv_refresh_sun_buffers();
+  prv_refresh_density_altitude_buffer();
 }
 
 static void prv_update_battery_state(BatteryChargeState state) {
@@ -349,6 +426,22 @@ static void prv_draw_sun_icon(GContext *ctx, GPoint origin, bool sunrise) {
   }
 }
 
+static void prv_draw_mountain_icon(GContext *ctx, GPoint origin) {
+  // A tall peak with a smaller one behind it. Each row is {y, x_from, x_to},
+  // inclusive; the base sits on y+10 like the other icons.
+  static const int8_t spans[][3] = {
+    {3, 3, 4}, {4, 2, 5}, {5, 1, 6}, {6, 0, 7}, {6, 9, 10},
+    {7, 0, 11}, {8, 0, 11}, {9, 0, 11}, {10, 0, 11},
+  };
+  graphics_context_set_fill_color(ctx, GColorBlack);
+  for (size_t i = 0; i < ARRAY_LENGTH(spans); ++i) {
+    graphics_fill_rect(ctx,
+                       GRect(origin.x + spans[i][1], origin.y + spans[i][0],
+                             spans[i][2] - spans[i][1] + 1, 1),
+                       0, GCornerNone);
+  }
+}
+
 static void prv_draw_info_icon(GContext *ctx, InfoIcon icon, GPoint origin) {
   switch (icon) {
     case InfoIconSteps:
@@ -362,6 +455,9 @@ static void prv_draw_info_icon(GContext *ctx, InfoIcon icon, GPoint origin) {
       break;
     case InfoIconSunset:
       prv_draw_sun_icon(ctx, origin, false);
+      break;
+    case InfoIconDensityAltitude:
+      prv_draw_mountain_icon(ctx, origin);
       break;
   }
 }
@@ -524,33 +620,48 @@ static void prv_canvas_update_proc(Layer *layer, GContext *ctx) {
   prv_draw_info_cell(ctx,
                      GRect(CONTENT_MARGIN, second_info_y,
                            cell_width, INFO_HEIGHT),
-                     InfoIconSunrise, "RISE", s_sunrise_buffer);
+                     s_sun_event_is_sunrise ? InfoIconSunrise : InfoIconSunset,
+                     s_sun_event_is_sunrise ? "RISE" : "SET",
+                     s_sun_event_buffer);
   prv_draw_info_cell(ctx,
                      GRect(CONTENT_MARGIN + cell_width + CELL_GAP,
                            second_info_y, cell_width, INFO_HEIGHT),
-                     InfoIconSunset, "SET", s_sunset_buffer);
+                     InfoIconDensityAltitude, "DA FT",
+                     s_density_altitude_buffer);
 }
 
-static void prv_request_sun_times(void) {
-  if (s_outbox_busy) {
+// Sun and weather requests share one message so neither waits on the other.
+static void prv_send_requests(bool sun, bool weather) {
+  if ((!sun && !weather) || s_outbox_busy) {
     return;
   }
-  s_last_sun_request_time = time(NULL);
-  persist_write_int(PERSIST_KEY_LAST_SUN_REQUEST,
-                    (int32_t)s_last_sun_request_time);
+  const time_t now = time(NULL);
+  if (sun) {
+    s_last_sun_request_time = now;
+    persist_write_int(PERSIST_KEY_LAST_SUN_REQUEST,
+                      (int32_t)s_last_sun_request_time);
+  }
+  if (weather) {
+    s_last_weather_request_time = now;
+  }
 
   DictionaryIterator *iterator;
   AppMessageResult result = app_message_outbox_begin(&iterator);
   if (result != APP_MSG_OK) {
-    APP_LOG(APP_LOG_LEVEL_WARNING, "Sun request begin failed: %d", (int)result);
+    APP_LOG(APP_LOG_LEVEL_WARNING, "Request begin failed: %d", (int)result);
     return;
   }
-  dict_write_uint8(iterator, MESSAGE_KEY_REQUEST_SUN, 1);
+  if (sun) {
+    dict_write_uint8(iterator, MESSAGE_KEY_REQUEST_SUN, 1);
+  }
+  if (weather) {
+    dict_write_uint8(iterator, MESSAGE_KEY_REQUEST_WEATHER, 1);
+  }
   result = app_message_outbox_send();
   if (result == APP_MSG_OK) {
     s_outbox_busy = true;
   } else {
-    APP_LOG(APP_LOG_LEVEL_WARNING, "Sun request send failed: %d", (int)result);
+    APP_LOG(APP_LOG_LEVEL_WARNING, "Request send failed: %d", (int)result);
   }
 }
 
@@ -571,10 +682,10 @@ static void prv_tick_handler(struct tm *tick_time, TimeUnits units_changed) {
   const bool day_changed = previous_date != s_current_date;
   const bool retry_boundary = tick_time->tm_min == 0 &&
       tick_time->tm_hour % 6 == 0;
-  if ((day_changed && !prv_has_sun_result_for_current_date()) ||
-      (retry_boundary && prv_sun_retry_is_due())) {
-    prv_request_sun_times();
-  }
+  const bool sun_due =
+      (day_changed && !prv_has_sun_result_for_current_date()) ||
+      (retry_boundary && prv_sun_retry_is_due());
+  prv_send_requests(sun_due, prv_weather_request_is_due());
 }
 
 static void prv_health_handler(HealthEventType event, void *context) {
@@ -591,25 +702,29 @@ static void prv_battery_handler(BatteryChargeState state) {
   prv_mark_dirty();
 }
 
-static void prv_inbox_received(DictionaryIterator *iterator, void *context) {
-  Tuple *ready_tuple = dict_find(iterator, MESSAGE_KEY_JS_READY);
-  if (ready_tuple && prv_sun_retry_is_due()) {
-    prv_request_sun_times();
-  }
+static void prv_receive_sun_times(DictionaryIterator *iterator) {
   Tuple *sunrise_tuple = dict_find(iterator, MESSAGE_KEY_SUNRISE_MINUTES);
   Tuple *sunset_tuple = dict_find(iterator, MESSAGE_KEY_SUNSET_MINUTES);
   Tuple *date_tuple = dict_find(iterator, MESSAGE_KEY_SUN_DATE);
-  if (!sunrise_tuple || !sunset_tuple || !date_tuple) {
+  Tuple *next_sunrise_tuple =
+      dict_find(iterator, MESSAGE_KEY_NEXT_SUNRISE_MINUTES);
+  Tuple *next_date_tuple = dict_find(iterator, MESSAGE_KEY_NEXT_SUN_DATE);
+  if (!sunrise_tuple || !sunset_tuple || !date_tuple ||
+      !next_sunrise_tuple || !next_date_tuple) {
     return;
   }
 
   const int32_t sunrise = sunrise_tuple->value->int32;
   const int32_t sunset = sunset_tuple->value->int32;
   const int32_t date = date_tuple->value->int32;
-  const bool has_times = sunrise >= 0 && sunrise < 24 * 60 &&
-      sunset >= 0 && sunset < 24 * 60;
+  const int32_t next_sunrise = next_sunrise_tuple->value->int32;
+  const int32_t next_date = next_date_tuple->value->int32;
+  const bool has_times = prv_is_minute_of_day(sunrise) &&
+      prv_is_minute_of_day(sunset);
   const bool has_no_events = sunrise == -1 && sunset == -1;
-  if ((!has_times && !has_no_events) || date <= 0) {
+  const bool next_valid = (prv_is_minute_of_day(next_sunrise) ||
+      next_sunrise == -1) && next_date > date;
+  if ((!has_times && !has_no_events) || date <= 0 || !next_valid) {
     APP_LOG(APP_LOG_LEVEL_WARNING, "Invalid sun data");
     return;
   }
@@ -617,11 +732,46 @@ static void prv_inbox_received(DictionaryIterator *iterator, void *context) {
   s_sunrise_minutes = sunrise;
   s_sunset_minutes = sunset;
   s_sun_date = date;
+  s_next_sunrise_minutes = next_sunrise;
+  s_next_sun_date = next_date;
   persist_write_int(PERSIST_KEY_SUNRISE_MINUTES, sunrise);
   persist_write_int(PERSIST_KEY_SUNSET_MINUTES, sunset);
   persist_write_int(PERSIST_KEY_SUN_DATE, date);
+  persist_write_int(PERSIST_KEY_NEXT_SUNRISE_MINUTES, next_sunrise);
+  persist_write_int(PERSIST_KEY_NEXT_SUN_DATE, next_date);
   prv_refresh_sun_buffers();
   prv_mark_dirty();
+}
+
+static void prv_receive_density_altitude(DictionaryIterator *iterator) {
+  Tuple *tuple = dict_find(iterator, MESSAGE_KEY_DENSITY_ALTITUDE_FT);
+  if (!tuple) {
+    return;
+  }
+  const int32_t feet = tuple->value->int32;
+  if (feet < DENSITY_ALTITUDE_MIN_FT || feet > DENSITY_ALTITUDE_MAX_FT) {
+    APP_LOG(APP_LOG_LEVEL_WARNING, "Invalid density altitude: %ld",
+            (long)feet);
+    return;
+  }
+  s_density_altitude_ft = feet;
+  s_density_altitude_time = time(NULL);
+  persist_write_int(PERSIST_KEY_DENSITY_ALTITUDE_FT, feet);
+  persist_write_int(PERSIST_KEY_DENSITY_ALTITUDE_TIME,
+                    (int32_t)s_density_altitude_time);
+  prv_refresh_density_altitude_buffer();
+  prv_mark_dirty();
+}
+
+static void prv_inbox_received(DictionaryIterator *iterator, void *context) {
+  Tuple *ready_tuple = dict_find(iterator, MESSAGE_KEY_JS_READY);
+  if (ready_tuple) {
+    // The phone side just started, so any earlier request was lost: ask for
+    // stale weather right away instead of waiting out the retry interval.
+    prv_send_requests(prv_sun_retry_is_due(), prv_weather_is_stale());
+  }
+  prv_receive_sun_times(iterator);
+  prv_receive_density_altitude(iterator);
 }
 
 static void prv_inbox_dropped(AppMessageResult reason, void *context) {
@@ -646,9 +796,21 @@ static void prv_load_persisted_sun(void) {
     s_sunrise_minutes = persist_read_int(PERSIST_KEY_SUNRISE_MINUTES);
     s_sunset_minutes = persist_read_int(PERSIST_KEY_SUNSET_MINUTES);
   }
+  if (persist_exists(PERSIST_KEY_NEXT_SUN_DATE) &&
+      persist_exists(PERSIST_KEY_NEXT_SUNRISE_MINUTES)) {
+    s_next_sun_date = persist_read_int(PERSIST_KEY_NEXT_SUN_DATE);
+    s_next_sunrise_minutes =
+        persist_read_int(PERSIST_KEY_NEXT_SUNRISE_MINUTES);
+  }
   if (persist_exists(PERSIST_KEY_LAST_SUN_REQUEST)) {
     s_last_sun_request_time =
         (time_t)persist_read_int(PERSIST_KEY_LAST_SUN_REQUEST);
+  }
+  if (persist_exists(PERSIST_KEY_DENSITY_ALTITUDE_FT) &&
+      persist_exists(PERSIST_KEY_DENSITY_ALTITUDE_TIME)) {
+    s_density_altitude_ft = persist_read_int(PERSIST_KEY_DENSITY_ALTITUDE_FT);
+    s_density_altitude_time =
+        (time_t)persist_read_int(PERSIST_KEY_DENSITY_ALTITUDE_TIME);
   }
 }
 

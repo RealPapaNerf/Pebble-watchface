@@ -1,55 +1,138 @@
 // SPDX-FileCopyrightText: 2026 MrReSc
 // SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Dallin Sumpter: sends tomorrow's sunrise, fetches current
+// weather from Open-Meteo and sends density altitude to the watch.
 
 'use strict';
 
 var SunTimes = require('./sun_times');
+var DensityAltitude = require('./density_altitude');
 var LOCATION_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+var WEATHER_LOCATION_MAX_AGE_MS = 30 * 60 * 1000;
 var LOCATION_TIMEOUT_MS = 15000;
-var requestInProgress = false;
+var WEATHER_TIMEOUT_MS = 20000;
+// Shown to the nearest 100 ft: model weather is not more precise than that.
+var DENSITY_ALTITUDE_ROUNDING_FT = 100;
+var WEATHER_URL = 'https://api.open-meteo.com/v1/forecast';
 
-function sendToWatch(payload, onComplete) {
-  Pebble.sendAppMessage(payload, function() {
-    console.log('simply-digital: message sent');
-    if (onComplete) {
-      onComplete();
+var sunRequestInProgress = false;
+var weatherRequestInProgress = false;
+
+// Pebble.sendAppMessage must not be called again until the previous message
+// is acknowledged, so sun and weather replies go through one queue.
+var outbox = [];
+var outboxBusy = false;
+
+function pumpOutbox() {
+  if (outboxBusy || outbox.length === 0) {
+    return;
+  }
+  outboxBusy = true;
+  var item = outbox.shift();
+  var done = function() {
+    outboxBusy = false;
+    if (item.onComplete) {
+      item.onComplete();
     }
+    pumpOutbox();
+  };
+  Pebble.sendAppMessage(item.payload, function() {
+    console.log('simply-digital: message sent');
+    done();
   }, function(error) {
     console.log('simply-digital: message failed: ' + JSON.stringify(error));
-    if (onComplete) {
-      onComplete();
-    }
+    done();
+  });
+}
+
+function sendToWatch(payload, onComplete) {
+  outbox.push({payload: payload, onComplete: onComplete});
+  pumpOutbox();
+}
+
+function getPosition(maximumAge, onSuccess, onFailure) {
+  navigator.geolocation.getCurrentPosition(onSuccess, function(error) {
+    console.log('simply-digital: location unavailable (' + error.code + ')');
+    onFailure();
+  }, {
+    enableHighAccuracy: false,
+    maximumAge: maximumAge,
+    timeout: LOCATION_TIMEOUT_MS
   });
 }
 
 function requestSunTimes() {
-  if (requestInProgress) {
+  if (sunRequestInProgress) {
     return;
   }
-  requestInProgress = true;
-  navigator.geolocation.getCurrentPosition(function(position) {
+  sunRequestInProgress = true;
+  getPosition(LOCATION_MAX_AGE_MS, function(position) {
     try {
       var result = SunTimes.calculate(
           new Date(), position.coords.latitude, position.coords.longitude);
       sendToWatch({
         'SUNRISE_MINUTES': result.sunrise,
         'SUNSET_MINUTES': result.sunset,
-        'SUN_DATE': result.date
+        'SUN_DATE': result.date,
+        'NEXT_SUNRISE_MINUTES': result.nextSunrise,
+        'NEXT_SUN_DATE': result.nextDate
       }, function() {
-        requestInProgress = false;
+        sunRequestInProgress = false;
       });
     } catch (error) {
-      requestInProgress = false;
+      sunRequestInProgress = false;
       console.log('simply-digital: sun calculation failed: ' + error.message);
     }
-  }, function(error) {
-    requestInProgress = false;
-    console.log('simply-digital: location unavailable (' + error.code + ')');
-  }, {
-    enableHighAccuracy: false,
-    maximumAge: LOCATION_MAX_AGE_MS,
-    timeout: LOCATION_TIMEOUT_MS
+  }, function() {
+    sunRequestInProgress = false;
   });
+}
+
+function requestWeather() {
+  if (weatherRequestInProgress) {
+    return;
+  }
+  weatherRequestInProgress = true;
+  var finish = function() {
+    weatherRequestInProgress = false;
+  };
+  getPosition(WEATHER_LOCATION_MAX_AGE_MS, function(position) {
+    // Two decimals (about 1 km) is plenty for model weather and keeps the
+    // exact position off the network.
+    var url = WEATHER_URL +
+        '?latitude=' + position.coords.latitude.toFixed(2) +
+        '&longitude=' + position.coords.longitude.toFixed(2) +
+        '&current=temperature_2m,dew_point_2m,surface_pressure';
+    var request = new XMLHttpRequest();
+    request.timeout = WEATHER_TIMEOUT_MS;
+    request.onload = function() {
+      try {
+        if (request.status !== 200) {
+          throw new Error('HTTP ' + request.status);
+        }
+        var feet = DensityAltitude.fromOpenMeteo(
+            JSON.parse(request.responseText));
+        var rounded = Math.round(feet / DENSITY_ALTITUDE_ROUNDING_FT) *
+            DENSITY_ALTITUDE_ROUNDING_FT;
+        console.log('simply-digital: density altitude ' + feet.toFixed(0) +
+                    ' ft');
+        sendToWatch({'DENSITY_ALTITUDE_FT': rounded}, finish);
+      } catch (error) {
+        finish();
+        console.log('simply-digital: weather failed: ' + error.message);
+      }
+    };
+    request.onerror = function() {
+      finish();
+      console.log('simply-digital: weather request error');
+    };
+    request.ontimeout = function() {
+      finish();
+      console.log('simply-digital: weather request timed out');
+    };
+    request.open('GET', url);
+    request.send();
+  }, finish);
 }
 
 Pebble.addEventListener('ready', function() {
@@ -57,7 +140,13 @@ Pebble.addEventListener('ready', function() {
 });
 
 Pebble.addEventListener('appmessage', function(event) {
-  if (event.payload && event.payload.REQUEST_SUN) {
+  if (!event.payload) {
+    return;
+  }
+  if (event.payload.REQUEST_SUN) {
     requestSunTimes();
+  }
+  if (event.payload.REQUEST_WEATHER) {
+    requestWeather();
   }
 });

@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 MrReSc
 // SPDX-License-Identifier: Apache-2.0
+// Modified 2026 by Dallin Sumpter: also returns tomorrow's sunrise.
 
 'use strict';
 
@@ -40,10 +41,18 @@ function calculateSunTimes(date, latitude, longitude) {
   calculationDate.setHours(12, 0, 0, 0);
   var times = SunCalc.getTimes(calculationDate, latitude, longitude);
   var hasSunEvents = isValidDate(times.sunrise) && isValidDate(times.sunset);
+
+  // Tomorrow's sunrise, so the watch can show it after today's sunset.
+  var nextDay = new Date(date.getFullYear(), date.getMonth(),
+                         date.getDate() + 1, 12, 0, 0, 0);
+  var nextTimes = SunCalc.getTimes(nextDay, latitude, longitude);
   return {
     date: dateCode(date),
     sunrise: hasSunEvents ? minutesOfDay(times.sunrise) : NO_SUN_EVENT,
-    sunset: hasSunEvents ? minutesOfDay(times.sunset) : NO_SUN_EVENT
+    sunset: hasSunEvents ? minutesOfDay(times.sunset) : NO_SUN_EVENT,
+    nextDate: dateCode(nextDay),
+    nextSunrise: isValidDate(nextTimes.sunrise) ?
+        minutesOfDay(nextTimes.sunrise) : NO_SUN_EVENT
   };
 }
 

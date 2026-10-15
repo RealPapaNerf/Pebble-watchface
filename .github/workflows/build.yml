@@ -1,0 +1,62 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Unit tests
+        run: |
+          node tests/sun_times_test.js
+          node tests/density_altitude_test.js
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install Pebble tool and SDK
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsdl2-2.0-0 libglib2.0-0 libpixman-1-0 zlib1g libsndio7.0
+          uv tool install --python 3.12 pebble-tool
+          yes | pebble sdk install latest
+
+      - name: Build
+        run: pebble build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: simply-digital-da
+          path: build/*.pbw
+
+      # A .pbw on a release page can be opened straight from the phone.
+      - name: Publish to the "latest" release
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp build/*.pbw simply-digital-da.pbw
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest simply-digital-da.pbw \
+            --title "Latest build" \
+            --notes "Built from ${GITHUB_SHA::7}. Open the .pbw on your phone to install."
+
+      # Real Open-Meteo request through the same math the phone runs.
+      # Informational only: a weather outage shouldn't fail the build.
+      - name: Live density altitude check (Cedar City)
+        continue-on-error: true
+        run: |
+          curl -fsS "https://api.open-meteo.com/v1/forecast?latitude=37.68&longitude=-113.06&current=temperature_2m,dew_point_2m,surface_pressure" -o weather.json
+          cat weather.json; echo
+          node -e "var D=require('./src/pkjs/density_altitude'); console.log('Density altitude: ' + Math.round(D.fromOpenMeteo(require('./weather.json'))) + ' ft')"

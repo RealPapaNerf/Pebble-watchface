@@ -1,4 +1,42 @@
-# Simply Digital
+# Simply Digital DA
+
+A modified version of [Simply Digital](https://github.com/MrReSc/simply-digital)
+by MrReSc (Apache-2.0). Changes from the original:
+
+- Date reads `mm/dd/yy`.
+- Sunrise and sunset share the bottom-left cell, which shows whichever comes
+  next (`RISE` before sunrise and after sunset, `SET` in between). After
+  sunset it shows tomorrow's sunrise.
+- The bottom-right cell shows **density altitude** in feet (`DA FT`), rounded
+  to the nearest 100 ft.
+- Its own app ID and name, so it installs alongside the original.
+
+### Density altitude
+
+About every 30 minutes the phone requests current temperature, dew point and
+surface (station) pressure from [Open-Meteo](https://open-meteo.com) and
+computes density altitude in
+[`src/pkjs/density_altitude.js`](src/pkjs/density_altitude.js):
+
+1. Vapor pressure from dew point.
+2. Virtual temperature `Tv = T / (1 - (e/P)(1 - 0.622))`.
+3. Density `rho = P / (287.05 * Tv)`.
+4. `DA = 145442.16 ft * (1 - (rho / 1.225)^0.234969)`, the ISA altitude with
+   that density.
+
+Readings older than two hours are shown as dashes. The weather is model data
+for the ~1 km grid point at the model's terrain height, not a measurement at
+your exact spot or elevation, so treat it as a planning figure.
+
+### Getting the .pbw
+
+Every push to `main` is built by GitHub Actions and attached to the
+[`latest` release](../../releases/tag/latest). Open `simply-digital-da.pbw` on
+your phone to sideload it with the Pebble app.
+
+---
+
+Original README:
 
 A monochrome retro-digital watchface for Pebble Time 2 (Emery, 200 × 228) with
 a large seven-segment clock, compact status rows and a rounded LCD-style frame.
