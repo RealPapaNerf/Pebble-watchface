@@ -1,0 +1,14 @@
+/build/
+/.lock-waf*
+/pebble-logs.txt
+/.pebble-logs.pid
+.DS_Store
+*~
+*.swp
+
+# Temporary emulator captures at the repository root.
+/screenshot_*.png
+/pebble_screenshot_*.png
+/icon_*.png
+/*.pbw
+/*.gif
