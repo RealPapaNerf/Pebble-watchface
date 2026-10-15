@@ -45,9 +45,9 @@ calculated on the phone and only the result is sent to the watch. Open-Meteo's
 own privacy policy applies to that request.
 
 With a valid result stored for the current date, the watchface does not request
-location again that day. If location is unavailable, it retries no sooner than
-six hours later while today's sun times remain missing. A new calendar day
-starts a new attempt independently of the retry interval.
+location again that day. If location is unavailable, it retries every 10
+minutes while today's sun times remain missing. A new calendar day starts a new
+attempt independently of the retry interval.
 
 If location access is denied or unavailable, the watchface continues to work
 and displays dashes for the sun time and density altitude.

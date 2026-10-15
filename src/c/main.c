@@ -35,7 +35,10 @@
 #define PERSIST_KEY_NEXT_SUN_DATE 6
 #define PERSIST_KEY_DENSITY_ALTITUDE_FT 7
 #define PERSIST_KEY_DENSITY_ALTITUDE_TIME 8
-#define SUN_RETRY_INTERVAL_SECONDS (6 * 60 * 60)
+// While today's sun times are missing, ask again this often. The original
+// waited for the next 00/06/12/18 h boundary at least 6 h later, so one failed
+// location fix could leave dashes on screen for most of a day.
+#define SUN_RETRY_SECONDS (10 * 60)
 // Fetch weather when the last reading is this old...
 #define WEATHER_REFRESH_SECONDS (30 * 60)
 // ...but don't ask the phone more often than this if requests keep failing.
@@ -673,21 +676,15 @@ static bool prv_sun_retry_is_due(void) {
   }
   const time_t now = time(NULL);
   return s_last_sun_request_time <= 0 || now < s_last_sun_request_time ||
-      now - s_last_sun_request_time >= SUN_RETRY_INTERVAL_SECONDS;
+      now - s_last_sun_request_time >= SUN_RETRY_SECONDS;
 }
 
 static void prv_tick_handler(struct tm *tick_time, TimeUnits units_changed) {
-  const int32_t previous_date = s_current_date;
   prv_update_clock_state(tick_time);
   prv_update_health_state();
   prv_mark_dirty();
-  const bool day_changed = previous_date != s_current_date;
-  const bool retry_boundary = tick_time->tm_min == 0 &&
-      tick_time->tm_hour % 6 == 0;
-  const bool sun_due =
-      (day_changed && !prv_has_sun_result_for_current_date()) ||
-      (retry_boundary && prv_sun_retry_is_due());
-  prv_send_requests(sun_due, prv_weather_request_is_due());
+  // A new day makes today's times missing, so this also covers midnight.
+  prv_send_requests(prv_sun_retry_is_due(), prv_weather_request_is_due());
 }
 
 static void prv_health_handler(HealthEventType event, void *context) {
@@ -769,8 +766,9 @@ static void prv_inbox_received(DictionaryIterator *iterator, void *context) {
   Tuple *ready_tuple = dict_find(iterator, MESSAGE_KEY_JS_READY);
   if (ready_tuple) {
     // The phone side just started, so any earlier request was lost: ask for
-    // stale weather right away instead of waiting out the retry interval.
-    prv_send_requests(prv_sun_retry_is_due(), prv_weather_is_stale());
+    // missing sun times and stale weather now, ignoring the retry timers.
+    prv_send_requests(!prv_has_sun_result_for_current_date(),
+                      prv_weather_is_stale());
   }
   prv_receive_sun_times(iterator);
   prv_receive_density_altitude(iterator);

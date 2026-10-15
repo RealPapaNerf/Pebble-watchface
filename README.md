@@ -75,12 +75,12 @@ Output: `build/simply-digital.pbw`. Other Pebble models are not supported.
 ## Sun times and privacy
 
 The phone calculates sun times locally, normally once per day. Today's stored
-result prevents further requests. Missing results are retried at six-hour clock
-boundaries after at least six hours; a new day starts a fresh attempt.
+result prevents further requests. Missing results are retried every 10 minutes
+(this version; the original waited for six-hour clock boundaries) and whenever
+the phone side restarts; a new day starts a fresh attempt.
 
-The app makes no web requests and does not store or transmit coordinates to a
-web service. The phone's location provider may use GPS, Wi-Fi or cellular
-services. Health data stays on the watch. See [PRIVACY.md](PRIVACY.md).
+Sun times use no web requests (density altitude does; see above). The phone's
+location provider may use GPS, Wi-Fi or cellular services. Health data stays on the watch. See [PRIVACY.md](PRIVACY.md).
 
 Sun times use the phone's local time zone, including daylight saving; phone and
 watch should use the same time zone. A location change may not be reflected
