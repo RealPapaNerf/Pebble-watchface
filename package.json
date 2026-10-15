@@ -2,7 +2,7 @@
   "name": "simply-digital",
   "author": "MrReSc",
   "description": "A monochrome seven-segment watchface for Pebble Time 2 with health and local sun times.",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "license": "Apache-2.0",
   "keywords": [
     "pebble-app",
@@ -35,7 +35,8 @@
       "NEXT_SUNRISE_MINUTES",
       "NEXT_SUN_DATE",
       "REQUEST_WEATHER",
-      "DENSITY_ALTITUDE_FT"
+      "DENSITY_ALTITUDE_FT",
+      "PHONE_STATUS"
     ],
     "resources": {
       "media": [

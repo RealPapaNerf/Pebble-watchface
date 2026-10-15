@@ -28,6 +28,17 @@ Readings older than two hours are shown as dashes. The weather is model data
 for the ~1 km grid point at the model's terrain height, not a measurement at
 your exact spot or elevation, so treat it as a planning figure.
 
+### When the sun or DA cell shows a message instead of a value
+
+| Shows   | Meaning |
+| ------- | ------- |
+| NO BT   | Watch isn't connected to the Pebble app. |
+| NO JS   | The watchface's phone-side JavaScript never started (90 s after launch). |
+| NO PERM | The phone refused location access to the Pebble app or this watchface. |
+| NO LOC  | Location is allowed, but the phone couldn't get a position. |
+| NO NET  | DA only: the Open-Meteo weather request failed. |
+| `--`    | Still waiting, or (sun cell) no sunrise/sunset today at this latitude. |
+
 ### Getting the .pbw
 
 Every push to `main` is built by GitHub Actions and attached to the

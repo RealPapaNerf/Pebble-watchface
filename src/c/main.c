@@ -47,6 +47,13 @@
 #define DENSITY_ALTITUDE_MAX_AGE_SECONDS (2 * 60 * 60)
 #define DENSITY_ALTITUDE_MIN_FT (-5000)
 #define DENSITY_ALTITUDE_MAX_FT 30000
+// Problems the phone reports; must match STATUS_* in src/pkjs/index.js.
+#define PHONE_STATUS_NO_PERMISSION 1
+#define PHONE_STATUS_NO_LOCATION 2
+#define PHONE_STATUS_NO_NETWORK 3
+// If the phone-side JavaScript hasn't said hello this long after launch,
+// it isn't running.
+#define PHONE_JS_WAIT_SECONDS 90
 
 typedef enum {
   InfoIconSteps,
@@ -85,6 +92,10 @@ static time_t s_last_sun_request_time;
 static int32_t s_density_altitude_ft;
 static time_t s_density_altitude_time;
 static time_t s_last_weather_request_time;
+static time_t s_launch_time;
+static bool s_phone_js_seen;
+static int32_t s_location_status;
+static bool s_network_failed;
 static uint8_t s_battery_percent;
 static bool s_health_subscribed;
 static bool s_outbox_busy;
@@ -129,6 +140,37 @@ static bool prv_is_minute_of_day(int32_t minutes) {
   return minutes >= 0 && minutes < 24 * 60;
 }
 
+// Why location-based values are missing, shown in place of dashes:
+//   NO BT    watch isn't connected to the Pebble app
+//   NO JS    the watchface's phone-side JavaScript never started
+//   NO PERM  the phone refused location access
+//   NO LOC   location allowed, but the phone couldn't get a position
+// NULL while there's no known problem (still waiting, or polar day/night).
+static const char *prv_location_problem_text(void) {
+  if (!connection_service_peek_pebble_app_connection()) {
+    return "NO BT";
+  }
+  if (!s_phone_js_seen) {
+    return time(NULL) - s_launch_time >= PHONE_JS_WAIT_SECONDS ? "NO JS" : NULL;
+  }
+  if (s_location_status == PHONE_STATUS_NO_PERMISSION) {
+    return "NO PERM";
+  }
+  if (s_location_status == PHONE_STATUS_NO_LOCATION) {
+    return "NO LOC";
+  }
+  return NULL;
+}
+
+// As above, plus NO NET when the weather request itself failed.
+static const char *prv_weather_problem_text(void) {
+  const char *problem = prv_location_problem_text();
+  if (!problem && s_network_failed) {
+    problem = "NO NET";
+  }
+  return problem;
+}
+
 // Picks whichever sun event comes next and formats it into one buffer:
 //   before today's sunrise  -> today's sunrise
 //   before today's sunset   -> today's sunset
@@ -159,6 +201,12 @@ static void prv_refresh_sun_buffers(void) {
   s_sun_event_is_sunrise = is_sunrise;
   prv_format_sun_time(s_sun_event_buffer, sizeof(s_sun_event_buffer),
                       event_minutes);
+  if (!prv_is_minute_of_day(event_minutes)) {
+    const char *problem = prv_location_problem_text();
+    if (problem) {
+      snprintf(s_sun_event_buffer, sizeof(s_sun_event_buffer), "%s", problem);
+    }
+  }
 }
 
 static bool prv_has_sun_result_for_current_date(void) {
@@ -186,8 +234,9 @@ static void prv_refresh_density_altitude_buffer(void) {
     snprintf(s_density_altitude_buffer, sizeof(s_density_altitude_buffer),
              "%ld", (long)s_density_altitude_ft);
   } else {
+    const char *problem = prv_weather_problem_text();
     snprintf(s_density_altitude_buffer, sizeof(s_density_altitude_buffer),
-             "--");
+             "%s", problem ? problem : "--");
   }
 }
 
@@ -738,6 +787,7 @@ static void prv_receive_sun_times(DictionaryIterator *iterator) {
   persist_write_int(PERSIST_KEY_SUN_DATE, date);
   persist_write_int(PERSIST_KEY_NEXT_SUNRISE_MINUTES, next_sunrise);
   persist_write_int(PERSIST_KEY_NEXT_SUN_DATE, next_date);
+  s_location_status = 0;
   prv_refresh_sun_buffers();
   prv_mark_dirty();
 }
@@ -758,11 +808,32 @@ static void prv_receive_density_altitude(DictionaryIterator *iterator) {
   persist_write_int(PERSIST_KEY_DENSITY_ALTITUDE_FT, feet);
   persist_write_int(PERSIST_KEY_DENSITY_ALTITUDE_TIME,
                     (int32_t)s_density_altitude_time);
+  s_location_status = 0;
+  s_network_failed = false;
+  prv_refresh_sun_buffers();
+  prv_refresh_density_altitude_buffer();
+  prv_mark_dirty();
+}
+
+static void prv_receive_phone_status(DictionaryIterator *iterator) {
+  Tuple *tuple = dict_find(iterator, MESSAGE_KEY_PHONE_STATUS);
+  if (!tuple) {
+    return;
+  }
+  const int32_t status = tuple->value->int32;
+  if (status == PHONE_STATUS_NO_NETWORK) {
+    s_network_failed = true;
+  } else if (status == PHONE_STATUS_NO_PERMISSION ||
+             status == PHONE_STATUS_NO_LOCATION) {
+    s_location_status = status;
+  }
+  prv_refresh_sun_buffers();
   prv_refresh_density_altitude_buffer();
   prv_mark_dirty();
 }
 
 static void prv_inbox_received(DictionaryIterator *iterator, void *context) {
+  s_phone_js_seen = true;
   Tuple *ready_tuple = dict_find(iterator, MESSAGE_KEY_JS_READY);
   if (ready_tuple) {
     // The phone side just started, so any earlier request was lost: ask for
@@ -772,6 +843,7 @@ static void prv_inbox_received(DictionaryIterator *iterator, void *context) {
   }
   prv_receive_sun_times(iterator);
   prv_receive_density_altitude(iterator);
+  prv_receive_phone_status(iterator);
 }
 
 static void prv_inbox_dropped(AppMessageResult reason, void *context) {
@@ -845,6 +917,7 @@ static void prv_window_unload(Window *window) {
 
 static void prv_init(void) {
   setlocale(LC_ALL, "");
+  s_launch_time = time(NULL);
   prv_load_persisted_sun();
   time_t now = time(NULL);
   struct tm *local_time = localtime(&now);

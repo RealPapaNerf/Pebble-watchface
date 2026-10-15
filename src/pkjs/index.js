@@ -50,15 +50,44 @@ function sendToWatch(payload, onComplete) {
   pumpOutbox();
 }
 
+// Problems are reported to the watch so it can show the reason instead of
+// dashes. Values must match PHONE_STATUS_* in main.c.
+var STATUS_NO_PERMISSION = 1;
+var STATUS_NO_LOCATION = 2;
+var STATUS_NO_NETWORK = 3;
+
+function reportStatus(status) {
+  sendToWatch({'PHONE_STATUS': status});
+}
+
+function locationStatusFor(error) {
+  var message = (error && error.message) ? String(error.message) : '';
+  if (/permission|denied|not authori[sz]ed/i.test(message)) {
+    return STATUS_NO_PERMISSION;
+  }
+  // Without a message, fall back to the W3C code (1 = PERMISSION_DENIED).
+  if (!message && error && error.code === 1) {
+    return STATUS_NO_PERMISSION;
+  }
+  return STATUS_NO_LOCATION;
+}
+
 function getPosition(maximumAge, onSuccess, onFailure) {
-  navigator.geolocation.getCurrentPosition(onSuccess, function(error) {
-    console.log('simply-digital: location unavailable (' + error.code + ')');
+  var fail = function(error) {
+    console.log('simply-digital: location unavailable (' +
+                (error && error.code) + ': ' + (error && error.message) + ')');
+    reportStatus(locationStatusFor(error));
     onFailure();
-  }, {
-    enableHighAccuracy: false,
-    maximumAge: maximumAge,
-    timeout: LOCATION_TIMEOUT_MS
-  });
+  };
+  try {
+    navigator.geolocation.getCurrentPosition(onSuccess, fail, {
+      enableHighAccuracy: false,
+      maximumAge: maximumAge,
+      timeout: LOCATION_TIMEOUT_MS
+    });
+  } catch (error) {
+    fail({code: 2, message: 'geolocation unavailable: ' + error.message});
+  }
 }
 
 function requestSunTimes() {
@@ -119,15 +148,18 @@ function requestWeather() {
         sendToWatch({'DENSITY_ALTITUDE_FT': rounded}, finish);
       } catch (error) {
         finish();
+        reportStatus(STATUS_NO_NETWORK);
         console.log('simply-digital: weather failed: ' + error.message);
       }
     };
     request.onerror = function() {
       finish();
+      reportStatus(STATUS_NO_NETWORK);
       console.log('simply-digital: weather request error');
     };
     request.ontimeout = function() {
       finish();
+      reportStatus(STATUS_NO_NETWORK);
       console.log('simply-digital: weather request timed out');
     };
     request.open('GET', url);
