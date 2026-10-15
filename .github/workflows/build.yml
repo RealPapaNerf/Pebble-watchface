@@ -28,17 +28,43 @@ jobs:
       - name: Install Pebble tool and SDK
         run: |
           sudo apt-get update
-          sudo apt-get install -y libsdl2-2.0-0 libglib2.0-0 libpixman-1-0 zlib1g libsndio7.0
+          sudo apt-get install -y libsdl2-2.0-0 libglib2.0-0 libpixman-1-0 zlib1g libsndio7.0 xvfb
           uv tool install --python 3.12 pebble-tool
           yes | pebble sdk install latest
 
       - name: Build
-        run: pebble build
+        run: |
+          pebble build 2>&1 | tee build.log
+          grep -E "warning:" build.log | while read -r line; do echo "::warning title=Compiler::$line"; done
+          grep -iE "footprint|free" build.log | while read -r line; do echo "::notice title=Memory::$line"; done
 
       - uses: actions/upload-artifact@v4
         with:
           name: simply-digital-da
           path: build/*.pbw
+
+      # Real Open-Meteo request through the same math the phone runs.
+      # Informational only: a weather outage shouldn't fail the build.
+      - name: Live density altitude check (Cedar City)
+        continue-on-error: true
+        run: |
+          curl -fsS "https://api.open-meteo.com/v1/forecast?latitude=37.68&longitude=-113.06&current=temperature_2m,dew_point_2m,surface_pressure" -o weather.json
+          echo "::notice title=Open-Meteo response::$(cat weather.json)"
+          DA=$(node -e "var D=require('./src/pkjs/density_altitude'); console.log(Math.round(D.fromOpenMeteo(require('./weather.json'))))")
+          echo "::notice title=Live density altitude::Cedar City ${DA} ft"
+
+      # Boots the Emery emulator, lets the phone-side JS run, and saves a
+      # screenshot that is attached to the release next to the .pbw.
+      - name: Emulator screenshot
+        continue-on-error: true
+        run: |
+          Xvfb :99 -screen 0 1024x768x24 &
+          export DISPLAY=:99
+          timeout 120 pebble install --emulator emery --logs > emu.log 2>&1 &
+          sleep 60
+          pebble screenshot --emulator emery --no-open preview.png
+          sleep 2
+          grep -iE "simply-digital|error|density|sun" emu.log | head -20 | while read -r line; do echo "::notice title=Emulator log::$line"; done
 
       # A .pbw on a release page can be opened straight from the phone.
       - name: Publish to the "latest" release
@@ -47,16 +73,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cp build/*.pbw simply-digital-da.pbw
+          FILES="simply-digital-da.pbw"
+          if [ -f preview.png ]; then FILES="$FILES preview.png"; fi
           gh release delete latest --yes --cleanup-tag || true
-          gh release create latest simply-digital-da.pbw \
+          gh release create latest $FILES \
             --title "Latest build" \
             --notes "Built from ${GITHUB_SHA::7}. Open the .pbw on your phone to install."
-
-      # Real Open-Meteo request through the same math the phone runs.
-      # Informational only: a weather outage shouldn't fail the build.
-      - name: Live density altitude check (Cedar City)
-        continue-on-error: true
-        run: |
-          curl -fsS "https://api.open-meteo.com/v1/forecast?latitude=37.68&longitude=-113.06&current=temperature_2m,dew_point_2m,surface_pressure" -o weather.json
-          cat weather.json; echo
-          node -e "var D=require('./src/pkjs/density_altitude'); console.log('Density altitude: ' + Math.round(D.fromOpenMeteo(require('./weather.json'))) + ' ft')"
