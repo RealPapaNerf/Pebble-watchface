@@ -17,7 +17,9 @@
 #define CELL_GAP 10
 #define ICON_SIZE 12
 #define INFO_VALUE_X_OFFSET 22
-#define DATE_VALUE_GAP 11
+// Narrower than the original 11 px: slashes make mm/dd/yy wider than dd.mm.yy,
+// and the extra room keeps "100%" from running into the weekday.
+#define DATE_VALUE_GAP 5
 #define PIXEL_GLYPH_WIDTH 5
 #define PIXEL_GLYPH_HEIGHT 7
 #define PIXEL_GLYPH_PITCH 6
